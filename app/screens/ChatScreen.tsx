@@ -1,5 +1,14 @@
-import { useState, useEffect } from 'react';
-import { View, Text, TextInput, FlatList, TouchableOpacity, StyleSheet, ActivityIndicator } from 'react-native';
+import { useState, useEffect, useRef } from 'react';
+import {
+  View,
+  Text,
+  TextInput,
+  FlatList,
+  TouchableOpacity,
+  StyleSheet,
+  ActivityIndicator,
+  Alert
+} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import * as SecureStore from 'expo-secure-store';
 import { track } from '../../utils/tracking';
@@ -11,6 +20,108 @@ type Message = {
 };
 
 export default function ChatScreen() {
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      id: '1',
+      text: 'Hello! I can help with math problems. Ask me anything!',
+      sender: 'ai'
+    }
+  ]);
+  const [inputText, setInputText] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const flatListRef = useRef<FlatList>(null);
+
+  const handleTokenError = async (error: any) => {
+    if (error?.status === 429) {
+      Alert.alert(
+        "Limit Reached",
+        "Maximum anonymous users reached today. Please try again tomorrow or register for full access."
+      );
+      return null;
+    }
+    Alert.alert("Error", "Failed to get anonymous token");
+    return null;
+  };
+
+  const getAnonymousToken = async () => {
+    try {
+      const response = await fetch('http://localhost:8000/api/anonymous/token', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+      
+      if (!response.ok) {
+        return await handleTokenError({
+          status: response.status,
+          response: response
+        });
+      }
+      return await response.json();
+    } catch (error) {
+      return await handleTokenError(error);
+    }
+  };
+
+  const handleSend = async () => {
+    const trimmedText = inputText.trim();
+    if (!trimmedText) return;
+
+    try {
+      setIsLoading(true);
+      setError('');
+
+      // Add user message immediately
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        text: trimmedText,
+        sender: 'user'
+      }]);
+      setInputText('');
+
+      let anonymousToken = await SecureStore.getItemAsync('anonymousToken');
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json'
+      };
+
+      if (!anonymousToken) {
+        const tokenData = await getAnonymousToken();
+        if (!tokenData) {
+          setIsLoading(false);
+          return;
+        }
+        anonymousToken = tokenData.token;
+        await SecureStore.setItemAsync('anonymousToken', anonymousToken);
+      }
+
+      headers['X-Anonymous-Token'] = anonymousToken;
+
+      const response = await fetch('http://localhost:8000/chat', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ message: trimmedText })
+      });
+
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+
+      const responseData = await response.json();
+      setMessages(prev => [...prev, {
+        id: Date.now().toString(),
+        text: responseData.response,
+        sender: 'ai'
+      }]);
+    } catch (error) {
+      setError('Failed to send message');
+      console.error('Chat error:', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   useEffect(() => {
     track('app_launch', {
       screen: 'Chat',
@@ -18,95 +129,30 @@ export default function ChatScreen() {
     });
   }, []);
 
-  const [messages, setMessages] = useState<Message[]>([
-    { id: '1', text: 'Hello! I can help with math problems. Ask me anything!', sender: 'ai' }
-  ]);
-  const [inputText, setInputText] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState('');
-
-  const handleSend = async () => {
-    if (!inputText.trim() || isLoading) return;
-    
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      text: inputText,
-      sender: 'user'
-    };
-    setMessages(prev => [...prev, userMessage]);
-    setInputText('');
-    setIsLoading(true);
-    setError('');
-    
-    try {
-      const response = await fetch('http://localhost:8000/chat', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ message: inputText })
-      });
-
-      if (!response.ok) {
-        if (response.status === 429) {
-          const errorData = await response.json();
-          setMessages(prev => [...prev, {
-            id: Date.now().toString() + '-limit',
-            text: errorData.detail || 'Daily free limit reached. Please sign in to continue.',
-            sender: 'system'
-          }]);
-          return;
-        }
-        throw new Error(`API error: ${response.status}`);
-      }
-
-      const data = await response.json();
-      
-      if (data.remaining <= 50) {  // Warn when low
-        setMessages(prev => [...prev, {
-          id: Date.now().toString() + '-warning',
-          text: `Warning: You have ${data.remaining} tokens remaining today`,
-          sender: 'system'
-        }]);
-      }
-
-      const aiMessage: Message = {
-        id: (Date.now() + 1).toString(),
-        text: data.response,
-        sender: 'ai'
-      };
-      setMessages(prev => [...prev, aiMessage]);
-    } catch (error) {
-      setError(error instanceof Error ? error.message : 'Request failed');
-    } finally {
-      setIsLoading(false);
+  useEffect(() => {
+    if (messages.length > 0) {
+      flatListRef.current?.scrollToEnd({ animated: true });
     }
-  };
+  }, [messages]);
 
   return (
     <View style={styles.container}>
       <FlatList
+        ref={flatListRef}
         data={messages}
         keyExtractor={(item) => item.id}
         renderItem={({ item }) => (
           <View style={[
-            styles.messageBubble, 
-            item.sender === 'user' ? styles.userBubble : 
-            item.sender === 'ai' ? styles.aiBubble : styles.systemBubble
+            styles.messageContainer,
+            item.sender === 'user' ? styles.userMessage : styles.aiMessage
           ]}>
             <Text style={styles.messageText}>{item.text}</Text>
           </View>
         )}
-        contentContainerStyle={styles.messagesContainer}
+        contentContainerStyle={styles.messagesList}
       />
 
-      {isLoading && (
-        <ActivityIndicator style={styles.loadingIndicator} size="small" />
-      )}
-
-      {error && (
-        <Text style={styles.errorText}>{error}</Text>
-      )}
+      {error ? <Text style={styles.errorText}>{error}</Text> : null}
 
       <View style={styles.inputContainer}>
         <TextInput
@@ -114,14 +160,19 @@ export default function ChatScreen() {
           value={inputText}
           onChangeText={setInputText}
           placeholder="Type your math question..."
+          placeholderTextColor="#999"
           editable={!isLoading}
         />
-        <TouchableOpacity 
-          style={styles.sendButton} 
+        <TouchableOpacity
+          style={styles.sendButton}
           onPress={handleSend}
-          disabled={isLoading}
+          disabled={isLoading || !inputText.trim()}
         >
-          <Ionicons name="send" size={24} color="white" />
+          {isLoading ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Ionicons name="send" size={24} color="white" />
+          )}
         </TouchableOpacity>
       </View>
     </View>
@@ -133,55 +184,59 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#f5f5f5',
   },
-  messagesContainer: {
-    padding: 10,
+  messagesList: {
+    padding: 16,
   },
-  messageBubble: {
+  messageContainer: {
+    maxWidth: '80%',
     padding: 12,
     borderRadius: 8,
-    marginVertical: 4,
-    maxWidth: '80%',
+    marginBottom: 8,
   },
-  userBubble: {
+  userMessage: {
     alignSelf: 'flex-end',
-    backgroundColor: '#4CAF50',
+    backgroundColor: '#007bff',
   },
-  aiBubble: {
+  aiMessage: {
     alignSelf: 'flex-start',
-    backgroundColor: '#333',
-  },
-  systemBubble: {
-    alignSelf: 'center',
-    backgroundColor: '#ccc',
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#ddd',
   },
   messageText: {
+    fontSize: 16,
+    color: '#333',
+  },
+  userMessageText: {
     color: 'white',
   },
   inputContainer: {
     flexDirection: 'row',
-    padding: 10,
-    backgroundColor: 'white',
-    alignItems: 'center',
+    padding: 8,
+    backgroundColor: '#fff',
+    borderTopWidth: 1,
+    borderTopColor: '#ddd',
   },
   input: {
     flex: 1,
+    padding: 12,
+    backgroundColor: '#fff',
+    borderRadius: 24,
     borderWidth: 1,
     borderColor: '#ddd',
-    borderRadius: 20,
-    padding: 10,
-    marginRight: 10,
+    marginRight: 8,
   },
   sendButton: {
-    backgroundColor: '#4CAF50',
-    borderRadius: 20,
-    padding: 10,
-  },
-  loadingIndicator: {
-    marginVertical: 10,
+    width: 48,
+    height: 48,
+    borderRadius: 24,
+    backgroundColor: '#007bff',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   errorText: {
     color: 'red',
     textAlign: 'center',
-    padding: 10,
+    padding: 8,
   },
 });

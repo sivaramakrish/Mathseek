@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordBearer
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials, OAuth2PasswordRequestForm, OAuth2PasswordBearer
 from fastapi_limiter import FastAPILimiter
@@ -27,6 +28,10 @@ from google.auth.transport import requests
 import uuid
 import redis
 from datetime import datetime
+# First ensure we have the proper Redis imports
+import redis.asyncio as async_redis
+import redis  # For sync operations
+from typing import Optional
 
 # Initialize FastAPI app
 app = FastAPI()
@@ -35,6 +40,9 @@ app = FastAPI()
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 from typing import Optional
+
+# OAuth2 scheme
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")  # Add this near other auth constants
 
 class User(BaseModel):
     id: str
@@ -148,6 +156,19 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode.update({"exp": expire})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+async def get_current_user_if_available(
+    request: Request,
+    token: str = Depends(oauth2_scheme)
+) -> Optional[dict]:
+    """Optional authentication dependency that returns user if authenticated, None otherwise"""
+    try:
+        # Only try auth if Authorization header exists
+        if request.headers.get("Authorization"):
+            return await get_current_user(request)
+        return None
+    except HTTPException:
+        return None
+
 async def get_current_user(request: Request):
     # Explicit header check
     auth_header = request.headers.get("Authorization")
@@ -184,25 +205,37 @@ async def get_current_user(request: Request):
 
 # New dependency for anonymous or authenticated users
 async def get_user_or_anonymous(request: Request):
-    try:
-        # First try authenticated user
-        user = await get_current_user(request)
-        logging.debug(f"Authenticated user: {user['sub']}")
-        return user
-    except HTTPException as auth_error:
-        logging.debug(f"Auth failed: {auth_error.detail}")
-        # Fall back to anonymous token check
-        if request.url.path.startswith("/chat"):
-            token = request.headers.get("X-Anonymous-Token")
-            logging.debug(f"Checking anonymous token: {token}")
-            if token:
-                async with redis.Redis.from_url(os.getenv("REDIS_URL")) as redis_client:
-                    quota = await redis_client.hget(f"anonymous:{token}", "quota_remaining")
-                    logging.debug(f"Token quota: {quota}")
-                    if quota and int(quota) > 0:
-                        logging.debug(f"Anonymous access granted for token: {token}")
-                        return {"sub": f"anonymous:{token}", "tier": "anonymous"}
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    logging.debug(f"Auth attempt - path: {request.url.path}")
+    
+    # First try regular authentication
+    auth_header = request.headers.get("Authorization")
+    logging.debug(f"Auth header: {auth_header}")
+    
+    if auth_header and auth_header.startswith("Bearer "):
+        try:
+            user = await get_current_user(request)
+            logging.debug(f"Authenticated user: {user['sub']}")
+            return user
+        except HTTPException as e:
+            logging.debug(f"Regular auth failed: {e.detail}")
+    
+    # Then try anonymous token
+    token = request.headers.get("X-Anonymous-Token")
+    logging.debug(f"Anonymous token: {token}")
+    
+    if token:
+        try:
+            async with redis.Redis.from_url(os.getenv("REDIS_URL")) as redis_client:
+                quota = await redis_client.hget(f"anonymous:{token}", "quota_remaining")
+                logging.debug(f"Token quota check: {quota}")
+                if quota and int(quota) > 0:
+                    logging.debug(f"Anonymous auth granted for token: {token}")
+                    return {"sub": f"anonymous:{token}", "tier": "anonymous"}
+        except Exception as e:
+            logging.error(f"Redis error: {str(e)}")
+    
+    logging.debug("No valid authentication method found")
+    raise HTTPException(status_code=401, detail="Not authenticated")
 
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -567,6 +600,86 @@ async def register_user(user: UserCreate):
 async def protected_route(user: dict = Depends(get_current_user)):
     return {"message": "You are authenticated"}
 
+@app.post("/chat", dependencies=[Depends(RateLimiter(times=10, minutes=1))])
+async def chat_endpoint(
+    request: Request,
+    message: dict = Body(...)
+):
+    """Handle chat messages with anonymous token support"""
+    try:
+        # First check for anonymous token
+        anonymous_token = request.headers.get("X-Anonymous-Token")
+        if anonymous_token:
+            redis_url = os.getenv("REDIS_URL")
+            if not redis_url:
+                raise HTTPException(status_code=500, detail="Server configuration error")
+
+            async with async_redis.Redis.from_url(redis_url) as redis_client:
+                quota = await redis_client.hget(f"anonymous:{anonymous_token}", "quota_remaining")
+                if not quota:
+                    raise HTTPException(status_code=401, detail="Invalid anonymous token")
+                
+                if int(quota) <= 0:
+                    raise HTTPException(status_code=429, detail="Daily quota exceeded")
+                
+                await redis_client.hincrby(f"anonymous:{anonymous_token}", "quota_remaining", -1)
+
+            return {"response": await process_chat_message(message["message"])}
+
+        # If no anonymous token, require regular auth
+        user = await get_current_user(request)
+        return {"response": await process_chat_message(message["message"])}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Chat error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Chat processing failed")
+async def process_chat_message(message: str) -> str:
+    """Process chat message and generate response"""
+    try:
+        # Call your AI/LLM service here
+        response = await call_deepseek_api(message)
+        return response["choices"][0]["message"]["content"]
+    except Exception as e:
+        logging.error(f"Chat processing error: {str(e)}")
+        return "Sorry, I couldn't process your message. Please try again later."
+
+# Add this near other utility functions
+async def call_deepseek_api(prompt: str) -> dict:
+    """Call the DeepSeek API with the given prompt"""
+    try:
+        api_key = os.getenv("DEEPSEEK_API_KEY")
+        if not api_key:
+            raise ValueError("DEEPSEEK_API_KEY not set")
+            
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "model": "deepseek-chat",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7
+        }
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers=headers,
+                json=data,
+                timeout=30.0
+            )
+            response.raise_for_status()
+            return response.json()
+            
+    except Exception as e:
+        logging.error(f"DeepSeek API error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to process message with AI service"
+        )
 # Updated chat endpoint
 @app.post("/chat", dependencies=[Depends(RateLimiter(times=10, minutes=1))])
 async def chat(
@@ -796,9 +909,62 @@ async def reset_usage():
         )
 
 # Health check endpoints
+# Then update the health check endpoint
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    """Endpoint to verify Redis connectivity"""
+    try:
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            return JSONResponse(
+                {"status": "REDIS_URL not configured"},
+                status_code=500
+            )
+        
+        # Use sync connection for health check
+        sync_redis = redis.Redis.from_url(redis_url)
+        if not sync_redis.ping():
+            return JSONResponse(
+                {"status": "Redis unavailable"},
+                status_code=500
+            )
+        
+        return {"status": "healthy"}
+    except Exception as e:
+        return JSONResponse(
+            {"status": f"Health check failed: {str(e)}"},
+            status_code=500
+        )
+        
+# Add this near your Redis config
+MAX_ANONYMOUS_TOKENS = 30  # New global limit
+
+@app.post("/api/anonymous/token")
+async def generate_anonymous_token():
+    """Generate token with daily limit check"""
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url:
+        raise HTTPException(500, "Redis not configured")
+
+    async with async_redis.Redis.from_url(redis_url) as r:
+        # Count existing tokens
+        token_count = len(await r.keys("anonymous:*"))
+        if token_count >= MAX_ANONYMOUS_TOKENS:
+            raise HTTPException(
+                status_code=429,
+                detail="Daily anonymous user limit reached"
+            )
+
+        token = str(uuid.uuid4())
+        await r.hset(
+            f"anonymous:{token}",
+            mapping={
+                "quota_remaining": 1000,
+                "quota_reset_at": (datetime.utcnow() + timedelta(days=1)).isoformat()
+            }
+        )
+        await r.expireat(f"anonymous:{token}", int((datetime.utcnow() + timedelta(days=1)).timestamp()))
+        return {"token": token}
 
 # Test endpoints
 @app.get("/test/user/{username}")
@@ -1030,21 +1196,61 @@ class AnonymousUser(BaseModel):
 @app.post("/api/anonymous/token")
 async def generate_anonymous_token():
     """Generate a new anonymous session token with daily quota"""
-    token = str(uuid.uuid4())
-    async with redis.Redis.from_url(os.getenv("REDIS_URL")) as redis_client:
-        await redis_client.hset(
-            f"anonymous:{token}",
-            mapping={
-                "quota_remaining": 1000,
-                "quota_reset_at": (datetime.utcnow() + timedelta(days=1)).isoformat()
-            }
-        )
-        await redis_client.expire(f"anonymous:{token}", 86400)  # 24h TTL
-    return {"token": token, "quota_remaining": 1000}
+    try:
+        # Validate Redis URL first
+        redis_url = os.getenv("REDIS_URL")
+        if not redis_url:
+            logging.error("REDIS_URL environment variable not set")
+            return JSONResponse(
+                {"error": "Server configuration error"},
+                status_code=500
+            )
 
-# Middleware for anonymous quota checks
+        token = str(uuid.uuid4())
+        reset_time = datetime.utcnow() + timedelta(days=1)
+        
+        try:
+            async with redis.Redis.from_url(redis_url) as redis_client:
+                # Test connection first
+                if not await redis_client.ping():
+                    raise ConnectionError("Redis connection failed")
+                    
+                await redis_client.hset(
+                    f"anonymous:{token}",
+                    mapping={
+                        "quota_remaining": 1000,
+                        "quota_reset_at": reset_time.isoformat()
+                    }
+                )
+                await redis_client.expire(f"anonymous:{token}", 86400)
+        except redis.RedisError as e:
+            logging.error(f"Redis operation failed: {str(e)}")
+            return JSONResponse(
+                {"error": "Token storage failed"},
+                status_code=500
+            )
+
+        return JSONResponse({
+            "token": token,
+            "quota_remaining": 1000,
+            "quota_reset_at": reset_time.isoformat()
+        })
+    except Exception as e:
+        logging.error(f"Token generation error: {str(e)}")
+        return JSONResponse(
+            {"error": "Token generation failed"},
+            status_code=500
+        )
+
+# Updated middleware
 @app.middleware("http")
 async def check_anonymous_quota(request: Request, call_next):
+    # Skip if already authenticated
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        return await call_next(request)
+        
+    # Check anonymous routes
     if request.url.path.startswith("/api/anonymous/") and request.url.path != "/api/anonymous/token":
         token = request.headers.get("X-Anonymous-Token")
         if not token:
@@ -1058,8 +1264,14 @@ async def check_anonymous_quota(request: Request, call_next):
             # Decrement quota for each request
             await redis_client.hincrby(f"anonymous:{token}", "quota_remaining", -1)
     
-    response = await call_next(request)
-    return response
+    return await call_next(request)
+
+@app.get("/debug/headers")
+async def debug_headers(request: Request):
+    return {
+        "headers": dict(request.headers),
+        "url": str(request.url)
+    }
 
 if __name__ == "__main__":
     import uvicorn
